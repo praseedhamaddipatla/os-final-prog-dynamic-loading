@@ -39,6 +39,7 @@ constexpr uint64_t MMAP = 9;         // mmap(addr, length, prot, flags, fd,
 constexpr uint64_t MUNMAP = 11;      // munmap(addr, length)
 constexpr uint64_t RT_SIGACTION = 13;
 constexpr uint64_t RT_SIGRETURN = 15;
+constexpr uint64_t PREAD64 = 17; // pread64(fd, buf, len, offset)
 constexpr uint64_t NANOSLEEP = 35;
 constexpr uint64_t ALARM = 37;
 constexpr uint64_t KILL = 62;

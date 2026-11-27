@@ -291,6 +291,47 @@ sync<uint64_t> dispatch(TCB *t) {
     if (file->type == impl::PIPE) co_return co_await file->read(buf, len); // copies out transactionally
     co_return co_await buffered_io(file.operator->(), buf, len, false);
   }
+  case Syscall::PREAD64: {
+    uint64_t fd = c.rdi;
+    auto *buf = reinterpret_cast<char *>(c.rsi);
+    uint64_t len = c.rdx;
+    int64_t offset = static_cast<int64_t>(c.r10);
+
+    if (offset < 0) co_return Syscall::EINVAL;
+
+    auto file = t->process->fd_table.get(fd);
+    if (file == nullptr || !file->rd) co_return Syscall::EBADF;
+
+    auto *seeking = file->seeking();
+    if (seeking == nullptr) co_return Syscall::ESPIPE;
+    if (co_await seeking->file->is_dir()) co_return Syscall::EISDIR;
+    if (len == 0) co_return 0;
+    if (!user_range(reinterpret_cast<uintptr_t>(buf), len)) co_return Syscall::EFAULT;
+
+    char bounce[FRAME_SIZE];
+    uint64_t total = 0;
+    uint64_t pos = static_cast<uint64_t>(offset);
+
+    //ext2 takes a 32-bit offset, so keep each read inside its range
+    while (total < len && pos < UINT32_MAX && !impl::current_thread_dead()) {
+      uint64_t chunk = std::min<uint64_t>(FRAME_SIZE, len - total);
+      chunk = std::min<uint64_t>(chunk, UINT32_MAX - pos);
+
+      int64_t count = co_await seeking->file->read_all(pos, chunk, bounce);
+      if (count < 0) co_return total ? total : count;
+      if (count == 0 || impl::current_thread_dead()) break;
+
+      //copy out after the file read so a user page fault happens outside it
+      uint64_t left = VMM::copy_user_(buf + total, bounce, count);
+      total += count - left;
+      if (left) co_return total ? total : Syscall::EFAULT;
+
+      pos += count;
+      if (static_cast<uint64_t>(count) < chunk) break;
+    }
+
+    co_return total;
+  }
   case Syscall::WRITE: {
     // write(fd, buf, len): stdout (1) goes to the console (COM2), stderr (2) to
     // the debug output (COM1).
