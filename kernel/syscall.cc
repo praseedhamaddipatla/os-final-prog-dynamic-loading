@@ -133,17 +133,19 @@ sync<uint64_t> getcwd(TCB *t, char *buf, uint64_t size) {
 }
 
 // copies a NULL-terminated array of NUL-terminated user strings (argv/envp) into kernel memory
-char **copy_strings(uintptr_t list) {
+char **copy_strings(uintptr_t list, uint64_t &budget, int64_t &error) {
   if (list == 0) return new char*[1]{nullptr};
 
   uint64_t n = 0;
   while (true) {
     char *s;
-    if (n >= PATH_MAX || !read_user(&s, (void*)(list + n*sizeof(char*)), sizeof(s))) return nullptr;
+    if (n >= budget / sizeof(char*)) { error = Syscall::E2BIG; return nullptr; }
+    if (!read_user(&s, (void*)(list + n*sizeof(char*)), sizeof(s))) return nullptr;
     if (s == nullptr) break;
     n++;
   }
 
+  budget -= n * sizeof(char*);
   char **out = new char*[n+1]();
   for (uint64_t i = 0; i < n; i++) {
     char *s;
@@ -151,7 +153,12 @@ char **copy_strings(uintptr_t list) {
     uint64_t len = 0;
     while (true) {
       char ch;
-      if (len >= PATH_MAX || !read_user(&ch, (void*)(uintptr_t(s) + len), 1)) {
+      if (len >= budget) {
+        error = Syscall::E2BIG;
+        impl::free_strings(out);
+        return nullptr;
+      }
+      if (!read_user(&ch, (void*)(uintptr_t(s) + len), 1)) {
         impl::free_strings(out);
         return nullptr;
       }
@@ -162,6 +169,7 @@ char **copy_strings(uintptr_t list) {
     out[i] = new char[len+1];
     if (!read_user(out[i], s, len+1)) { impl::free_strings(out); return nullptr; }
     out[i][len] = '\0';
+    budget -= len + 1;
   }
   out[n] = nullptr;
   return out;
@@ -704,15 +712,39 @@ sync<uint64_t> dispatch(TCB *t) {
     if (res.error) co_return res.error;
     if (!co_await res.file->is_file()) co_return Syscall::EACCES;
 
-    char **kargv = copy_strings(argv);
-    if (kargv == nullptr) co_return Syscall::EFAULT;
-    char **kenvp = copy_strings(envp);
+    uint64_t budget = impl::PROCESS_STACK_SIZE;
+    int64_t copy_error = Syscall::EFAULT;
+    char **kargv = copy_strings(argv, budget, copy_error);
+    if (kargv == nullptr) co_return copy_error;
+    char **kenvp = copy_strings(envp, budget, copy_error);
     if (kenvp == nullptr) {
       impl::free_strings(kargv);
-      co_return Syscall::EFAULT;
+      co_return copy_error;
     }
 
-    co_return co_await t->process->exec(t, res.file, kargv, kenvp);
+    // Linux's executed name for a path relative to an explicit directory fd.
+    // Keep the lookup path above unchanged; this name is only for AT_EXECFN.
+    struct ExecName { char bytes[PATH_MAX + 32]; };
+    UniqueRef<ExecName> execname;
+    if (path[0] != '/' && dir_fd != Syscall::AT_FDCWD) {
+      execname = UniqueRef<ExecName>{new ExecName};
+      char *out = execname->bytes;
+      constexpr char prefix[] = "/dev/fd/";
+      memcpy(out, prefix, sizeof(prefix) - 1);
+      out += sizeof(prefix) - 1;
+      char digits[20];
+      unsigned n = 0;
+      do {
+        digits[n++] = '0' + dir_fd % 10;
+        dir_fd /= 10;
+      } while (dir_fd);
+      while (n) *out++ = digits[--n];
+      *out++ = '/';
+      memcpy(out, path, strlen(path) + 1);
+      path = execname->bytes;
+    }
+
+    co_return co_await t->process->exec(t, res.file, path, kargv, kenvp);
   }
   default:
     co_return Syscall::ENOSYS;

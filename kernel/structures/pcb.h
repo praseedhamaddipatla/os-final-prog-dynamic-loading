@@ -525,7 +525,7 @@ private:
     SpinLock forkLock;
 public:
     sync<StrongRef<PCB>> fork(const UserContext &ctx);
-    sync<uint64_t> exec(TCB *t, StrongRef<Node> file, char **argv, char **envp);
+    sync<uint64_t> exec(TCB *t, StrongRef<Node> file, const char *path, char **argv, char **envp);
     sync<uint64_t> wait_child(uint64_t pid, bool &found);
     sync<StrongRef<TCB>> create_thread(uint64_t stack_size);
     void finish(uint64_t exit_code);
@@ -597,12 +597,12 @@ struct TCB {
         context.rflags = FORCED_FLAGS;
     }
 
-    sync<bool> setup_stack(uint64_t stack_size) {
+    sync<bool> setup_stack(uint64_t stack_size, int prot = VMM::PROT_READ | VMM::PROT_WRITE) {
         CCB::current()->current_thread = this;
 
         this->stack_size = stack_size;
         stack_base = (uintptr_t)co_await VMM::mmap(
-            (void*)(0x700000000000ull - tid * 0x100000ull), stack_size, VMM::PROT_READ | VMM::PROT_WRITE,
+            (void*)(0x700000000000ull - tid * 0x100000ull), stack_size, prot,
             VMM::MAP_PRIVATE | VMM::MAP_ANONYMOUS, {}, 0);
         if ((void *)stack_base == VMM::MAP_FAILED) co_return false;
 
@@ -613,20 +613,6 @@ struct TCB {
 
     TCB(StrongRef<PCB> process, const UserContext &parent_ctx, uint64_t tid)
         : context(parent_ctx), tid(tid), process(process) {}
-
-    sync<void> load_and_enter(StrongRef<Node> file) {
-        CCB::current()->current_thread = this; // all memory operations should operate with this thread
-        context.rip = co_await ELF::load(file);
-        constexpr char name[] = "/sbin/init";
-        uintptr_t arg = context.rsp - sizeof(name);
-        memcpy((void*)arg, name, sizeof(name));
-        // argc, argv[0], NULL, envp NULL, AT_NULL.
-        uint64_t *sp = (uint64_t*)((arg - 6 * sizeof(uint64_t)) & ~uintptr_t(15));
-        for (int i = 0; i < 6; i++) sp[i] = 0;
-        sp[0] = 1;
-        sp[1] = arg;
-        context.rsp = (uintptr_t)sp;
-    }
 
     [[noreturn]] void resume();
 };

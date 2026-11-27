@@ -113,6 +113,8 @@ constexpr uint64_t CLONE_CHILD_CLEARTID = 0x200000;
 // error results
 constexpr int64_t ENOENT = -2;
 constexpr int64_t ESRCH = -3;
+constexpr int64_t E2BIG = -7;
+constexpr int64_t ENOEXEC = -8;
 constexpr int64_t EBADF = -9;
 constexpr int64_t ECHILD = -10;
 constexpr int64_t EAGAIN = -11;
