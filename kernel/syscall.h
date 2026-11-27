@@ -56,6 +56,7 @@ constexpr uint64_t WAIT4 = 61;       // wait4(pid, status, options, rusage),
 constexpr uint64_t GETCWD = 79;      // getcwd(buf, size), returns bytes including NUL
 constexpr uint64_t CHDIR = 80;       // chdir(path)
 constexpr uint64_t GETPPID = 110;    // getppid()
+constexpr uint64_t ARCH_PRCTL = 158; // arch_prctl(op, addr)
 constexpr uint64_t REBOOT = 169;     // reboot(magic, magic2, cmd, arg), all
                                      //      actions shut down
 constexpr uint64_t GETTID = 186;     // gettid()
@@ -92,6 +93,9 @@ constexpr uint64_t AT_FDCWD = -100;
 constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
 constexpr uint64_t AT_EMPTY_PATH = 0x1000;
 
+constexpr uint32_t ARCH_SET_FS = 0x1002;
+constexpr uint32_t ARCH_GET_FS = 0x1003;
+
 constexpr uint32_t FUTEX_WAIT = 0;
 constexpr uint32_t FUTEX_WAKE = 1;
 constexpr uint32_t FUTEX_PRIVATE_FLAG = 128;
@@ -115,6 +119,7 @@ constexpr uint64_t CLONE_PARENT_SETTID = 0x100000;
 constexpr uint64_t CLONE_CHILD_CLEARTID = 0x200000;
 
 // error results
+constexpr int64_t EPERM = -1;
 constexpr int64_t ENOENT = -2;
 constexpr int64_t ESRCH = -3;
 constexpr int64_t EIO = -5;

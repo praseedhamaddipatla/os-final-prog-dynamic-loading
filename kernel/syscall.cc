@@ -806,6 +806,28 @@ sync<uint64_t> dispatch(TCB *t) {
 
     co_return 0;
   }
+  case Syscall::ARCH_PRCTL: {
+    uint32_t op = static_cast<uint32_t>(c.rdi);
+    uint64_t addr = c.rsi;
+
+    if (op == Syscall::ARCH_SET_FS) {
+      if (addr >= VMM::VA_END) co_return Syscall::EPERM;
+
+      // Resume loads this thread's saved FS base.
+      c.fs_base = addr;
+      co_return 0;
+    }
+
+    if (op == Syscall::ARCH_GET_FS) {
+      uint64_t base = c.fs_base;
+      if (!write_user(reinterpret_cast<void *>(addr), &base, sizeof(base))) {
+        co_return Syscall::EFAULT;
+      }
+      co_return 0;
+    }
+
+    co_return Syscall::EINVAL;
+  }
   case Syscall::GETPPID: { co_return t->process->ppid; }
   case Syscall::GETTID: { co_return t->tid; }
   case Syscall::WAIT4: {
