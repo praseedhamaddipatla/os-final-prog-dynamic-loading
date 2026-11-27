@@ -25,6 +25,7 @@
 #include "async/sync.h"
 #include "machine/x86_64.h"
 
+#include <cstddef>
 #include <utility>
 
 #include "kernel_main.h"
@@ -87,6 +88,65 @@ bool read_user(void *dst, const void *src, uint64_t len) {
 }
 bool write_user(void *dst, const void *src, uint64_t len) {
   return user_range(uintptr_t(dst), len) && !VMM::copy_user_(dst, src, len);
+}
+
+struct LinuxStat {
+  uint64_t dev, ino, nlink;
+  uint32_t mode, uid, gid, pad;
+  uint64_t rdev;
+  int64_t size, blksize, blocks;
+  uint64_t atimeSec, atimeNsec;
+  uint64_t mtimeSec, mtimeNsec;
+  uint64_t ctimeSec, ctimeNsec;
+  int64_t reserved[3];
+};
+
+static_assert(sizeof(LinuxStat) == 144);
+static_assert(offsetof(LinuxStat, mode) == 24);
+static_assert(offsetof(LinuxStat, size) == 48);
+static_assert(offsetof(LinuxStat, reserved) == 120);
+
+sync<void> statNode(Node *node, LinuxStat &stat) {
+  auto proof = co_await node->inode.readonly();
+  const auto &inode = proof.data();
+
+  stat.dev = 1; // one ext2 filesystem
+  stat.ino = node->number;
+  stat.nlink = inode.links_count;
+  stat.mode = inode.mode;
+  stat.uid = inode.uid;
+  stat.gid = inode.gid;
+  stat.size = inode.size_low;
+  stat.blksize = node->block_size;
+  stat.blocks = inode.sectors;
+  stat.atimeSec = inode.atime;
+  stat.mtimeSec = inode.mtime;
+  stat.ctimeSec = inode.ctime;
+}
+
+sync<int64_t> statFd(TCB *t, uint64_t fd, void *out) {
+  auto file = t->process->fd_table.get(fd);
+  if (file == nullptr) co_return Syscall::EBADF;
+
+  LinuxStat stat{};
+  if (auto *seeking = file->seeking()) {
+    co_await statNode(seeking->file.operator->(), stat);
+  } else {
+    // Basic metadata for the console and pipes.
+    stat.dev = 2;
+    stat.nlink = 1;
+    stat.blksize = FRAME_SIZE;
+    if (file->type == impl::CONSOLE) {
+      stat.mode = Ext2Inode::CharacterDevice | 0620;
+      stat.rdev = 0x101;
+    } else {
+      stat.mode = Ext2Inode::FIFO | 0600;
+    }
+  }
+
+  // The inode lock is released before copying to user memory.
+  if (!write_user(out, &stat, sizeof(stat))) co_return Syscall::EFAULT;
+  co_return 0;
 }
 
 constexpr uint64_t PATH_MAX = 4096;
@@ -685,6 +745,28 @@ sync<uint64_t> dispatch(TCB *t) {
       co_return Syscall::EFAULT;
     }
     co_return 0;
+  }
+  case Syscall::FSTAT:
+    co_return co_await statFd(t, c.rdi, reinterpret_cast<void *>(c.rsi));
+  case Syscall::NEWFSTATAT: {
+    if (!(c.r10 & Syscall::AT_EMPTY_PATH)) co_return Syscall::ENOSYS;
+
+    char first;
+    if (!read_user(&first, reinterpret_cast<const void *>(c.rsi), sizeof(first))) {
+      co_return Syscall::EFAULT;
+    }
+    if (first != '\0') co_return Syscall::ENOSYS;
+
+    auto *out = reinterpret_cast<void *>(c.rdx);
+    if (c.rdi == Syscall::AT_FDCWD) {
+      auto cwd = t->process->get_cwd();
+      LinuxStat stat{};
+      co_await statNode(cwd.operator->(), stat);
+      if (!write_user(out, &stat, sizeof(stat))) co_return Syscall::EFAULT;
+      co_return 0;
+    }
+
+    co_return co_await statFd(t, c.rdi, out);
   }
   case Syscall::CLOSE: {
     // close(fd)

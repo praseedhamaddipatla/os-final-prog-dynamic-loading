@@ -32,6 +32,7 @@ constexpr uint64_t READ = 0;         // read(fd, buf, len), files and console
 constexpr uint64_t WRITE = 1;        // write(fd, buf, len), to the console
 constexpr uint64_t OPEN = 2;         // open(path, flags, mode)
 constexpr uint64_t CLOSE = 3;        // close(fd)
+constexpr uint64_t FSTAT = 5;        // fstat(fd, statbuf)
 constexpr uint64_t LSEEK = 8;        // lseek(fd, offset, whence)
 constexpr uint64_t MMAP = 9;         // mmap(addr, length, prot, flags, fd,
                                      //      offset), anonymous or MAP_PRIVATE
@@ -63,6 +64,7 @@ constexpr uint64_t EXIT_GROUP = 231; // exit_group(code), the whole process
 constexpr uint64_t OPENAT = 257;     // openat(dirfd, path, flags, mode),
                                      //      ignore permissions and write to
                                      //      files
+constexpr uint64_t NEWFSTATAT = 262; // newfstatat(dirfd, path, statbuf, flags)
 constexpr uint64_t DUP3 = 292;       // dup3(oldFd, newFd, flags)
 constexpr uint64_t PIPE2 = 293;      // pipe2(pipefd[2], flags)
 constexpr uint64_t EXECVEAT = 322;   // execveat(dirfd, path, argv, envp,
