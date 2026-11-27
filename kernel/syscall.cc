@@ -351,6 +351,49 @@ sync<uint64_t> dispatch(TCB *t) {
 
     co_return co_await buffered_io(file.operator->(), buf, len, true);
   }
+  case Syscall::WRITEV: {
+    struct Iovec {
+      uintptr_t base;
+      uint64_t len;
+    };
+
+    uint64_t fd = c.rdi;
+    uintptr_t iov = c.rsi;
+    uint64_t count = c.rdx;
+
+    if (count > 1024) co_return Syscall::EINVAL;
+
+    auto file = t->process->fd_table.get(fd);
+    if (file == nullptr || !file->wr) co_return Syscall::EBADF;
+    if (count == 0) co_return 0;
+    if (!user_range(iov, count * sizeof(Iovec))) co_return Syscall::EFAULT;
+
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < count && !impl::current_thread_dead(); i++) {
+      Iovec entry;
+      auto *addr = reinterpret_cast<const void *>(iov + i * sizeof(Iovec));
+
+      //copy the descriptor before using its buffer address
+      if (!read_user(&entry, addr, sizeof(entry))) {
+        co_return total ? total : Syscall::EFAULT;
+      }
+      if (entry.len == 0) continue;
+      if (!user_range(entry.base, entry.len)) {
+        co_return total ? total : Syscall::EFAULT;
+      }
+
+      auto *buf = reinterpret_cast<char *>(entry.base);
+      int64_t written = co_await buffered_io(file.operator->(), buf, entry.len, true);
+      if (written < 0) co_return total ? total : written;
+
+      total += written;
+
+      //stop here if only part of this buffer was written
+      if (static_cast<uint64_t>(written) < entry.len) break;
+    }
+
+    co_return total;
+  }
   case Syscall::SCHED_YIELD: {
     co_await yield();
     co_return 0;
