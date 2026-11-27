@@ -113,6 +113,7 @@ constexpr uint64_t CLONE_CHILD_CLEARTID = 0x200000;
 // error results
 constexpr int64_t ENOENT = -2;
 constexpr int64_t ESRCH = -3;
+constexpr int64_t EIO = -5;
 constexpr int64_t E2BIG = -7;
 constexpr int64_t ENOEXEC = -8;
 constexpr int64_t EBADF = -9;
@@ -134,6 +135,7 @@ constexpr int64_t ENAMETOOLONG = -36;
 constexpr int64_t ENOSYS = -38;
 constexpr int64_t ELOOP = -40;
 constexpr int64_t EOVERFLOW = -75;
+constexpr int64_t ELIBBAD = -80;
 
 constexpr uint64_t RUSAGE_STRUCT_SIZE = 152;
 

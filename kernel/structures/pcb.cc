@@ -166,138 +166,166 @@ uint64_t TCB::provision_tid() {
 }
 
 namespace {
-// Eight auxiliary values, followed by AT_NULL, 0.
-constexpr uint64_t AUX_PAIRS = 9;
-struct ExecPlan {
-    ELF::Info mainInfo{}, interpInfo{};
+struct ExecFiles {
+    ELF::Info mainInfo{};
+    ELF::Info interpInfo{};
     StrongRef<Node> interpFile{};
-    uint64_t argc = 0, envc = 0;
-    uint8_t random[16]{};
 };
 
-// Use CPU entropy rather than predictable timestamps for AT_RANDOM. A CPU
-// without RDRAND (or a temporarily exhausted generator) fails before teardown.
-bool exec_random(uint8_t (&bytes)[16]) {
-    uint32_t eax, ebx, ecx, edx;
-    cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-    if (!(ecx & (1u << 30))) return false;
-    for (unsigned i = 0; i < sizeof(bytes); i += sizeof(uint64_t)) {
-        uint64_t value = 0;
+//check both files before tearing down the old process
+sync<int64_t> prepareExec(StrongRef<Node> file, StrongRef<Node> cwd, ExecFiles &files) {
+    files.mainInfo = co_await ELF::parse(file);
+    if (!files.mainInfo.ok) co_return Syscall::ENOEXEC;
+    if (!files.mainInfo.hasInterp) co_return 0;
+
+    auto result = co_await fs->find(cwd, files.mainInfo.interp);
+    if (result.error) co_return result.error;
+    if (!co_await result.file->is_file()) co_return Syscall::EACCES;
+
+    files.interpFile = result.file;
+    files.interpInfo = co_await ELF::parse(files.interpFile);
+    if (!files.interpInfo.ok || !files.interpInfo.isPie || files.interpInfo.hasInterp) {
+        co_return Syscall::ELIBBAD;
+    }
+    co_return 0;
+}
+
+struct AuxEntry {
+    uint64_t type;
+    uint64_t value;
+};
+
+struct StackInfo {
+    uint64_t argc = 0;
+    uint64_t envc = 0;
+    uint64_t size = 0;
+    uint64_t random[2]{};
+};
+
+//include the terminating auxv entry in the count
+constexpr uint64_t AUX_COUNT = 15;
+
+bool measureStack(const char *path, char *const argv[], char *const envp[],
+                  uint64_t stackSize, StackInfo &stack) {
+    //use the same aligned capacity as setup_stack
+    const uint64_t capacity = stackSize & ~uint64_t(15);
+    const uint64_t fixed = 3 * sizeof(uint64_t) + AUX_COUNT * sizeof(AuxEntry) + sizeof(stack.random);
+    if (capacity < fixed) return false;
+    uint64_t remaining = capacity - fixed;
+    auto account = [&remaining](uint64_t bytes) {
+        if (bytes > remaining) return false;
+        remaining -= bytes;
+        return true;
+    };
+
+    if (!account(strlen(path) + 1)) return false;
+    while (argv[stack.argc]) {
+        if (!account(sizeof(uint64_t)) || !account(strlen(argv[stack.argc]) + 1)) {
+            return false;
+        }
+        ++stack.argc;
+    }
+    while (envp[stack.envc]) {
+        if (!account(sizeof(uint64_t)) || !account(strlen(envp[stack.envc]) + 1)) {
+            return false;
+        }
+        ++stack.envc;
+    }
+
+    const uint64_t bytes = capacity - remaining;
+    stack.size = (bytes + 15) & ~uint64_t(15);
+    return stack.size <= capacity;
+}
+
+//get real random bytes before tearing down the old process
+bool fillRandom(StackInfo &stack) {
+    uint32_t a, b, c, d;
+    cpuid(1, 0, &a, &b, &c, &d);
+    if (!(c & (1u << 30))) return false;
+
+    for (auto &word : stack.random) {
         unsigned char ready = 0;
-        for (int tries = 0; tries < 64 && !ready; ++tries)
-            asm volatile("rdrand %0; setc %1" : "=&r"(value), "=qm"(ready) : : "cc");
+        for (int attempt = 0; attempt < 10 && !ready; ++attempt) {
+            asm volatile("rdrand %0; setc %1" : "=&r"(word), "=qm"(ready) : : "cc");
+        }
         if (!ready) return false;
-        memcpy(bytes + i, &value, sizeof(value));
     }
     return true;
 }
 
-// Validate everything we can while the caller's old image is still intact.
-sync<int64_t> prepareExec(StrongRef<Node> file, StrongRef<Node> cwd,
-                          const char *path, const char *const *argv,
-                          const char *const *envp, uint64_t stack_size,
-                          ExecPlan &plan) {
-    plan.mainInfo = co_await ELF::parse(file);
-    if (!plan.mainInfo.ok) co_return Syscall::ENOEXEC;
-    if (plan.mainInfo.hasInterp) {
-        auto found = co_await fs->find(cwd, plan.mainInfo.interp);
-        if (found.error) co_return found.error;
-        plan.interpFile = found.file;
-        if (!co_await plan.interpFile->is_file()) co_return Syscall::EACCES;
-        plan.interpInfo = co_await ELF::parse(plan.interpFile);
-        if (!plan.interpInfo.ok || !plan.interpInfo.isPie || plan.interpInfo.hasInterp)
-            co_return Syscall::ENOEXEC;
-    }
+uintptr_t writeStack(TCB *t, const char *path, char *const argv[], char *const envp[],
+                     const StackInfo &stack, const ELF::Loaded &mainImage, uint64_t interpBias) {
+    uintptr_t top = t->context.rsp;
+    ASSERT(top >= t->stack_base && stack.size <= top - t->stack_base);
+    const uintptr_t start = top - stack.size;
+    auto *words = reinterpret_cast<uint64_t *>(start);
 
-    // argc, argv NULL, envp NULL, auxv, random bytes, and worst-case alignment.
-    uint64_t remaining = stack_size & ~uint64_t(15);
-    const uint64_t fixed = (3 + AUX_PAIRS * 2) * sizeof(uint64_t) + 16 + 15;
-    if (remaining < fixed) co_return Syscall::E2BIG;
-    remaining -= fixed;
-    auto account = [&remaining](uint64_t n) {
-        if (n > remaining) return false;
-        remaining -= n;
-        return true;
+    //copy strings from the top so we can write their pointers directly below
+    auto copyString = [&top](const char *str) {
+        const uint64_t len = strlen(str) + 1;
+        top -= len;
+        memcpy(reinterpret_cast<void *>(top), str, len);
+        return top;
     };
-    if (!account(strlen(path) + 1)) co_return Syscall::E2BIG;
-    while (argv[plan.argc]) {
-        if (!account(sizeof(uint64_t)) || !account(strlen(argv[plan.argc]) + 1))
-            co_return Syscall::E2BIG;
-        ++plan.argc;
-    }
-    while (envp[plan.envc]) {
-        if (!account(sizeof(uint64_t)) || !account(strlen(envp[plan.envc]) + 1))
-            co_return Syscall::E2BIG;
-        ++plan.envc;
-    }
-    if (!exec_random(plan.random)) co_return Syscall::EAGAIN;
-    co_return 0;
+
+    *words++ = stack.argc;
+    for (uint64_t i = 0; i < stack.argc; ++i) *words++ = copyString(argv[i]);
+    *words++ = 0;
+    for (uint64_t i = 0; i < stack.envc; ++i) *words++ = copyString(envp[i]);
+    *words++ = 0;
+
+    const uintptr_t execName = copyString(path);
+    top -= sizeof(stack.random);
+    memcpy(reinterpret_cast<void *>(top), stack.random, sizeof(stack.random));
+
+    //this kernel has one root identity
+    const AuxEntry aux[] = {
+        {3, mainImage.phdr},    //at_phdr
+        {4, mainImage.phent},   //at_phent
+        {5, mainImage.phnum},   //at_phnum
+        {6, FRAME_SIZE},        //at_pagesz
+        {7, interpBias},        //at_base needs the interpreter's load bias
+        {9, mainImage.entry},   //at_entry still points to the main executable
+        {11, 0},               //at_uid
+        {12, 0},               //at_euid
+        {13, 0},               //at_gid
+        {14, 0},               //at_egid
+        {17, 100},             //at_clktck
+        {23, 0},               //at_secure
+        {25, top},             //at_random
+        {31, execName},        //at_execfn keeps the path separate from argv[0]
+        {0, 0}                 //at_null
+    };
+    static_assert(sizeof(aux) == AUX_COUNT * sizeof(AuxEntry));
+    ASSERT(reinterpret_cast<uintptr_t>(words) + sizeof(aux) <= top);
+    memcpy(words, aux, sizeof(aux));
+    return start;
 }
 
-uint64_t build_stack(TCB *t, const ExecPlan &plan, const char *path,
-                     const char *const *argv, const char *const *envp,
-                     const ELF::Loaded &mainImage, const ELF::Loaded &interpImage) {
-    uint64_t p = t->context.rsp;
-    auto copy = [&p](const void *src, uint64_t n) {
-        p -= n;
-        memcpy((void *)p, src, n);
-        return p;
-    };
-    const uint64_t execfn = copy(path, strlen(path) + 1);
-    const uint64_t random = copy(plan.random, sizeof(plan.random));
-    const uint64_t count = plan.argc + plan.envc;
-    auto *ptrs = new uint64_t[count];
-    for (uint64_t i = count; i-- > 0;) {
-        const char *s = i < plan.argc ? argv[i] : envp[i - plan.argc];
-        ptrs[i] = copy(s, strlen(s) + 1);
-    }
-
-    const uint64_t words = count + 3 + AUX_PAIRS * 2;
-    auto *sp = (uint64_t *)((p - words * sizeof(uint64_t)) & ~uint64_t(15));
-    ASSERT((uint64_t)sp >= t->stack_base);
-    uint64_t n = 0;
-    sp[n++] = plan.argc;
-    for (uint64_t i = 0; i < plan.argc; ++i) sp[n++] = ptrs[i];
-    sp[n++] = 0;
-    for (uint64_t i = 0; i < plan.envc; ++i) sp[n++] = ptrs[plan.argc + i];
-    sp[n++] = 0;
-    delete[] ptrs;
-
-    auto aux = [sp, &n](uint64_t type, uint64_t value) {
-        sp[n++] = type;
-        sp[n++] = value;
-    };
-    aux(9, mainImage.entry);  // AT_ENTRY always names the executable.
-    aux(3, mainImage.phdr);  // AT_PHDR
-    aux(4, mainImage.phent); // AT_PHENT
-    aux(5, mainImage.phnum); // AT_PHNUM
-    aux(7, interpImage.bias); // AT_BASE is the interpreter's load bias.
-    aux(6, FRAME_SIZE);      // AT_PAGESZ
-    aux(31, execfn);         // AT_EXECFN is independent of argv[0].
-    aux(25, random);         // AT_RANDOM
-    aux(0, 0);               // AT_NULL
-    ASSERT(n == words);
-    return (uint64_t)sp;
-}
-
-// Shared by boot and exec: images first, then the stack, then user registers.
-sync<bool> start_image(TCB *t, StrongRef<Node> file, const ExecPlan &plan,
-                       const char *path, const char *const *argv,
-                       const char *const *envp, uint64_t stack_size) {
+//map both images before choosing a spot for the stack
+sync<bool> startExec(TCB *t, StrongRef<Node> file, const ExecFiles &files,
+                     const char *path, char *const argv[], char *const envp[],
+                     const StackInfo &stack, uint64_t stackSize) {
     CCB::current()->current_thread = t;
-    auto mainImage = co_await ELF::map(file, plan.mainInfo, ELF::PLACE_MAIN);
+    auto mainImage = co_await ELF::map(file, files.mainInfo, ELF::PLACE_MAIN);
     if (!mainImage.ok) co_return false;
-    ELF::Loaded interpImage{};
-    if (plan.mainInfo.hasInterp) {
-        interpImage = co_await ELF::map(plan.interpFile, plan.interpInfo, ELF::PLACE_INTERP);
+
+    uint64_t entry = mainImage.entry;
+    uint64_t interpBias = 0;
+    if (files.mainInfo.hasInterp) {
+        auto interpImage = co_await ELF::map(files.interpFile, files.interpInfo, ELF::PLACE_INTERP);
         if (!interpImage.ok) co_return false;
+        entry = interpImage.entry;
+        interpBias = interpImage.bias;
     }
+
     int prot = VMM::PROT_READ | VMM::PROT_WRITE;
-    if (plan.mainInfo.hasStack && plan.mainInfo.stackExec) prot |= VMM::PROT_EXEC;
-    if (!co_await t->setup_stack(stack_size, prot)) co_return false;
-    const uint64_t sp = build_stack(t, plan, path, argv, envp, mainImage, interpImage);
+    if (files.mainInfo.stackExec) prot |= VMM::PROT_EXEC;
+    if (!co_await t->setup_stack(stackSize, prot)) co_return false;
+
+    const uintptr_t sp = writeStack(t, path, argv, envp, stack, mainImage, interpBias);
     t->context = UserContext{};
-    t->context.rip = plan.mainInfo.hasInterp ? interpImage.entry : mainImage.entry;
+    t->context.rip = entry;
     t->context.rsp = sp;
     t->context.rflags = FORCED_FLAGS;
     co_return true;
@@ -305,27 +333,35 @@ sync<bool> start_image(TCB *t, StrongRef<Node> file, const ExecPlan &plan,
 } // namespace
 
 sync<StrongRef<TCB>> PCB::create(StrongRef<Node> init, uint64_t stack_size) {
-  const char *argv[] = {"/sbin/init", nullptr};
-  const char *envp[] = {nullptr};
-  ExecPlan plan;
-  if (co_await prepareExec(init, fs->root, "/sbin/init", argv, envp, stack_size, plan))
-    co_return StrongRef<TCB>{};
+    StrongRef<PCB> pcb{new PCB{provision_pid()}};
+    pcb->self = WeakRef{pcb};
+    pcb->cwd = fs->root;
+    { LockGuard g{pid_lock}; process_table.put(pcb->pid, WeakRef{pcb}); }
 
-  StrongRef<PCB> pcb{new PCB{provision_pid()}};
-  pcb->self = WeakRef{pcb};
-  pcb->cwd = fs->root;
-  { LockGuard g{pid_lock}; process_table.put(pcb->pid, WeakRef{pcb}); }
+    StrongRef<TCB> thread = co_await pcb->create_thread();
+    if (thread == nullptr) {
+        pcb->finish(127);
+        co_return StrongRef<TCB>{};
+    }
 
-  StrongRef<TCB> thread = co_await pcb->create_thread(0);
-  if (!co_await start_image(thread.operator->(), init, plan, "/sbin/init", argv, envp, stack_size)) {
-    thread->zombie = true;
-    pcb->finish(127);
-    CCB::current()->current_thread = nullptr;
-    drop_to_kernel_cr3();
-    co_return StrongRef<TCB>{};
-  }
-
-  co_return thread;
+    char path[] = "/sbin/init";
+    char *argv[] = {path, nullptr};
+    char *envp[] = {nullptr};
+    ExecFiles files{};
+    StackInfo stack{};
+    const int64_t error = co_await prepareExec(init, pcb->get_cwd(), files);
+    bool ready = !error && measureStack(path, argv, envp, stack_size, stack) && fillRandom(stack);
+    if (ready) {
+        ready = co_await startExec(thread.operator->(), init, files, path, argv, envp, stack, stack_size);
+    }
+    if (!ready) {
+        thread->zombie = true;
+        pcb->finish(127);
+        CCB::current()->current_thread = nullptr;
+        drop_to_kernel_cr3();
+        co_return StrongRef<TCB>{};
+    }
+    co_return thread;
 }
 
 sync<StrongRef<PCB>> PCB::fork(const UserContext &ctx) {
@@ -369,8 +405,15 @@ void free_strings(char **v) {
 }
 
 sync<uint64_t> PCB::exec(TCB *t, StrongRef<Node> file, const char *path, char **argv, char **envp) {
-    ExecPlan plan;
-    const int64_t error = co_await prepareExec(file, get_cwd(), path, argv, envp, PROCESS_STACK_SIZE, plan);
+    ExecFiles files{};
+    StackInfo stack{};
+    int64_t error = co_await prepareExec(file, get_cwd(), files);
+    if (!error && !measureStack(path, argv, envp, PROCESS_STACK_SIZE, stack)) {
+        error = Syscall::E2BIG;
+    }
+    if (!error && !fillRandom(stack)) {
+        error = Syscall::EIO;
+    }
     if (error) {
         free_strings(argv);
         free_strings(envp);
@@ -417,7 +460,7 @@ sync<uint64_t> PCB::exec(TCB *t, StrongRef<Node> file, const char *path, char **
     }
     set_cr3(as->cr3_phys());
 
-    const bool ok = co_await start_image(t, file, plan, path, argv, envp, PROCESS_STACK_SIZE);
+    const bool ok = co_await startExec(t, file, files, path, argv, envp, stack, PROCESS_STACK_SIZE);
 
     free_strings(argv);
     free_strings(envp);
@@ -430,7 +473,7 @@ sync<uint64_t> PCB::exec(TCB *t, StrongRef<Node> file, const char *path, char **
     co_return 0;
 }
 
-sync<StrongRef<TCB>> PCB::create_thread(uint64_t stack_size)
+sync<StrongRef<TCB>> PCB::create_thread()
 {
     if (get_cr3() != as->cr3_phys()) set_cr3(as->cr3_phys());
 
@@ -441,8 +484,6 @@ sync<StrongRef<TCB>> PCB::create_thread(uint64_t stack_size)
 
     StrongRef t{new TCB{pcb, TCB::provision_tid()}};
     t->self = WeakRef{t};
-    // Boot defers stack allocation until both ELF images have been mapped.
-    if (stack_size && !co_await t->setup_stack(stack_size)) co_return StrongRef<TCB>{};
     t->anchor = t;
 
     if (leader == nullptr) leader = tail = t.operator->();

@@ -527,7 +527,7 @@ public:
     sync<StrongRef<PCB>> fork(const UserContext &ctx);
     sync<uint64_t> exec(TCB *t, StrongRef<Node> file, const char *path, char **argv, char **envp);
     sync<uint64_t> wait_child(uint64_t pid, bool &found);
-    sync<StrongRef<TCB>> create_thread(uint64_t stack_size);
+    sync<StrongRef<TCB>> create_thread();
     void finish(uint64_t exit_code);
 
     PCB(const PCB &) = delete;
