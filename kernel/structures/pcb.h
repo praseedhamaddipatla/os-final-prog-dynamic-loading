@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <utility>
 
+#include "structures/aslr.h"
 #include "async/future.h"
 #include "lib/shared.h"
 #include "async/spin_lock.h"
@@ -590,7 +591,7 @@ struct TCB {
 
     // Only stacks allocated by setup_stack are kernel-owned. clone3 stacks
     // are caller-owned and must not be unmapped by the thread-exit path.
-    uint64_t stack_base = 0, stack_size = 0;
+    uint64_t stack_base = 0, stack_size = 0, guard_size = 0;
 
     TCB(StrongRef<PCB> process, uint64_t tid)
         : tid(tid), process(process) {
@@ -601,10 +602,31 @@ struct TCB {
         CCB::current()->current_thread = this;
 
         this->stack_size = stack_size;
+        this->guard_size = 0;
+
+        // aslr: slide stack down rand num of pages (>=256mb)
+        uint64_t slide = 0;
+        if (ASLR_ON) slide = (aslrRandom() % 0x10000) * 4096ull;
+        void *hint = (void*)(0x700000000000ull - tid * 0x100000ull - slide);
+
         stack_base = (uintptr_t)co_await VMM::mmap(
-            (void*)(0x700000000000ull - tid * 0x100000ull), stack_size, prot,
+            hint, stack_size, prot,
             VMM::MAP_PRIVATE | VMM::MAP_ANONYMOUS, {}, 0);
         if ((void *)stack_base == VMM::MAP_FAILED) co_return false;
+
+        // guard page= 1 PROT_NONE page right under stack, touch = SIGSEGV
+        // no MAP_FIXED so cant stomp on anything, just check where landed
+        if (stack_base > 4096) {
+            void *want = (void *)(stack_base - 4096);
+            void *got = co_await VMM::mmap(want, 4096, VMM::PROT_NONE,
+                                           VMM::MAP_PRIVATE | VMM::MAP_ANONYMOUS, {}, 0);
+            if (got == want) {
+                guard_size = 4096;
+            } else if (got != VMM::MAP_FAILED) {
+                // landed somewhere else, give it back (stack still works w/o guard)
+                co_await VMM::munmap(got, 4096);
+            }
+        }
 
         uintptr_t stack_top = (stack_base + stack_size) & ~uintptr_t(15);
         context.rsp = stack_top;

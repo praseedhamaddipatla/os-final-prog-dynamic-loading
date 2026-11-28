@@ -24,6 +24,7 @@
 
 #include "pcb.h"
 #include "elf.h"
+#include "aslr.h"
 
 #include "memory/physmem.h"
 #include "lib/shared.h"
@@ -50,6 +51,7 @@ constexpr uint32_t PF_R = 4;
 //only pickBase() uses these so aslr can change later
 constexpr uint64_t MAIN_BASE = 0x555555554000ull;
 constexpr uint64_t INTERP_BASE = 0x7ffff7fc0000ull;
+constexpr uint64_t SLIDE_PAGES = 0x40000; //how far we can slide in pages
 
 // raw elf header straight from file
 struct [[gnu::packed]] RawHeader {
@@ -90,8 +92,14 @@ uint64_t roundUp(uint64_t x) { return roundDown(x + FRAME_SIZE - 1); }
 
 // picks base addr for pie image. ONE place so aslr is easy
 uint64_t pickBase(int place) {
-  if (place == ELF::PLACE_INTERP) return INTERP_BASE;
-  return MAIN_BASE;
+  // random page aligned slide (0 if aslr is off)
+  uint64_t slide = 0;
+  if (ASLR_ON) slide = (aslrRandom() % SLIDE_PAGES) * FRAME_SIZE;
+
+  // main goes up from its base, interp goes down from base
+  // so cant run into eo
+  if (place == ELF::PLACE_INTERP) return INTERP_BASE - slide;
+  return MAIN_BASE + slide;
 }
 
 // checks one PT_LOAD (unbiased addrs)

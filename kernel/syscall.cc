@@ -563,9 +563,11 @@ sync<uint64_t> dispatch(TCB *t) {
     {
       TCB *z = t->process->leader; while (z) { ASSERT(z->zombie); z = z->next_process; }
       t->process->finish(c.rdi);
-    } else if (t->stack_size != 0) {
+        } else if (t->stack_size != 0) {
       // clone3 stacks belong to the caller (pthread_join unmaps them).
-      co_await VMM::munmap(VA{t->stack_base}, t->stack_size);
+      // stacks from setup_stack have guard page, unmap that too
+      co_await VMM::munmap(VA{t->stack_base - t->guard_size},
+                           t->stack_size + t->guard_size);
     }
     co_return 0;
   }

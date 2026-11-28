@@ -1,5 +1,4 @@
 PASS: ok_exec
-PASS: ok_pie
 PASS: ok_exec_fixed
 PASS: ok_pie_gap
 PASS: ok_pie_low
@@ -7,6 +6,7 @@ PASS: ok_pie_high
 PASS: ok_extras
 PASS: ok_loads_16
 PASS: ok_phnum_64
+PASS: aslr_spread
 PASS: fault_exec_rodata
 PASS: fault_exec_text
 PASS: fault_exec_nx_data
